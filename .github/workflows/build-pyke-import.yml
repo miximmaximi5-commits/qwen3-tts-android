@@ -1,0 +1,260 @@
+name: Build Qwen3 TTS - PYKE Import WAV
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 55
+    steps:
+      - name: Checkout source and submodules
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - name: Install Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Prepare Android SDK and NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null || true
+          sdkmanager "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.2.12479018"
+
+      - name: Apply PYKE Import WAV changes
+        run: |
+          mkdir -p tools
+          cat > tools/ImportedWavValidator.kt <<'KOTLIN'
+          package com.qwen.tts.android.data
+          
+          import java.io.File
+          import java.io.RandomAccessFile
+          
+          /** Only accept the exact format already produced by VoiceRecorder. */
+          fun validatePcmWav24kMono(file: File): Long {
+              require(file.length() in 44L..4_000_000L) { "WAV must be under 4 MB" }
+              RandomAccessFile(file, "r").use { raf ->
+                  fun tag(): String = ByteArray(4).also { raf.readFully(it) }.toString(Charsets.US_ASCII)
+                  fun u32(): Long = Integer.toUnsignedLong(Integer.reverseBytes(raf.readInt()))
+                  fun u16(): Int = java.lang.Short.toUnsignedInt(java.lang.Short.reverseBytes(raf.readShort()))
+                  require(tag() == "RIFF") { "Expected RIFF WAV" }
+                  u32() // RIFF length
+                  require(tag() == "WAVE") { "Expected WAVE audio" }
+          
+                  var formatOk = false
+                  var dataBytes = 0L
+                  while (raf.filePointer + 8 <= raf.length()) {
+                      val kind = tag()
+                      val bytes = u32()
+                      val start = raf.filePointer
+                      require(bytes <= raf.length() - start) { "WAV chunk is incomplete" }
+                      if (kind == "fmt ") {
+                          require(bytes >= 16) { "Incomplete WAV format" }
+                          val format = u16()
+                          val channels = u16()
+                          val sampleRate = u32()
+                          u32() // byte rate
+                          u16() // block alignment
+                          val bitsPerSample = u16()
+                          formatOk = (format == 1 && channels == 1 && sampleRate == 24_000L && bitsPerSample == 16)
+                      }
+                      if (kind == "data") dataBytes = bytes
+                      val next = start + bytes + (bytes and 1L)
+                      if (next > raf.length()) break
+                      raf.seek(next)
+                  }
+                  require(formatOk) { "Convert to PCM WAV, 24 kHz, mono, 16-bit" }
+                  require(dataBytes > 0 && dataBytes % 2L == 0L) { "Invalid or empty WAV data" }
+                  val durationMillis = dataBytes * 1_000L / (24_000L * 2L)
+                  require(durationMillis in 3_000L..30_000L) { "Use a clean 3–30 second speech clip" }
+                  return durationMillis
+              }
+          }
+          KOTLIN
+          cat > tools/apply_import_patch.py <<'PYTHON'
+          #!/usr/bin/env python3
+          """Patch upstream Danmoreng/qwen3-tts-android MainActivity.kt (v0.1.0)."""
+          import sys
+          from pathlib import Path
+          
+          repo = Path(sys.argv[1] if len(sys.argv) > 1 else '.').resolve()
+          app = repo / 'app/src/main/java/com/qwen/tts/android/MainActivity.kt'
+          gradle = repo / 'app/build.gradle.kts'
+          manifest = repo / 'app/src/main/AndroidManifest.xml'
+          validator = repo / 'app/src/main/java/com/qwen/tts/android/data/ImportedWavValidator.kt'
+          source_validator = Path(__file__).with_name('ImportedWavValidator.kt')
+          
+          for p in (app, gradle, manifest, source_validator):
+              if not p.is_file():
+                  sys.exit(f'Missing {p}. Run inside the ORIGINAL qwen3-tts-android source repository.')
+          
+          source = app.read_text(encoding='utf-8')
+          if 'fun importVoiceFromWav(' in source:
+              print('Already patched MainActivity.kt; no changes needed.')
+              sys.exit(0)
+          
+          
+          def one_replace(body: str, old: str, new: str) -> str:
+              count = body.count(old)
+              if count != 1:
+                  raise RuntimeError(f'Expected one matching insertion point, found {count}: {old[:85]!r}. Upstream source may have changed.')
+              return body.replace(old, new, 1)
+          
+          # 1. Reuse the very same engine and DB entity used by the microphone workflow.
+          source = one_replace(
+              source,
+              'import com.qwen.tts.android.data.VoiceRecorder\n',
+              'import com.qwen.tts.android.data.VoiceRecorder\n'
+              'import com.qwen.tts.android.data.validatePcmWav24kMono\n',
+          )
+          
+          method = '''    fun importVoiceFromWav(name: String, uri: Uri) {
+                  if (_uiState.value.busy || recorderState.value.isRecording) return
+                  val trimmedName = name.trim().ifBlank { "Imported Voice ${voices.value.size + 1}" }
+                  viewModelScope.launch {
+                      startBusy(status = "Importing WAV voice")
+                      val created = runCatching {
+                          withContext(Dispatchers.IO) {
+                              val voiceId = "voice-${System.currentTimeMillis()}"
+                              val targetDir = File(voiceDir, voiceId).apply { mkdirs() }
+                              try {
+                                  val reference = File(targetDir, "reference.wav")
+                                  val resolver = getApplication<Application>().contentResolver
+                                  resolver.openInputStream(uri)?.use { input ->
+                                      reference.outputStream().use { output ->
+                                          val chunk = ByteArray(8_192)
+                                          var total = 0L
+                                          while (true) {
+                                              val count = input.read(chunk)
+                                              if (count < 0) break
+                                              if (count == 0) continue
+                                              total += count
+                                              require(total <= 4_000_000L) { "WAV exceeds 4 MB" }
+                                              output.write(chunk, 0, count)
+                                          }
+                                      }
+                                  } ?: error("Cannot open the selected file")
+          
+                                  val durationMillis = validatePcmWav24kMono(reference)
+                                  val native = ensureEngineLoaded(selectedVariant())
+                                  val caps = native.getModelCapabilities()
+                                  if (caps?.supportsCloning == false) {
+                                      error("The loaded model does not expose a speaker encoder")
+                                  }
+                                  val embedding = File(targetDir, "speaker.json")
+                                  if (!native.extractSpeakerEmbedding(reference.absolutePath, embedding.absolutePath)) {
+                                      error(native.getLastError() ?: "Speaker embedding extraction failed")
+                                  }
+                                  VoiceProfileEntity(
+                                      voiceId = voiceId,
+                                      name = makeUniqueVoiceName(trimmedName),
+                                      referenceWavPath = reference.absolutePath,
+                                      speakerEmbeddingPath = embedding.absolutePath,
+                                      durationMillis = durationMillis,
+                                  )
+                              } catch (t: Throwable) {
+                                  targetDir.deleteRecursively()
+                                  throw t
+                              }
+                          }
+                      }
+                      created.fold(
+                          onSuccess = { voice ->
+                              dao.insertVoice(voice)
+                              stopBusyTicker()
+                              _uiState.update {
+                                  it.copy(busy = false, selectedVoiceId = voice.voiceId,
+                                      status = "Voice imported", error = null)
+                              }
+                          },
+                          onFailure = { throwable ->
+                              stopBusyTicker()
+                              _uiState.update {
+                                  it.copy(busy = false, status = "Voice import failed",
+                                      error = throwable.message ?: "Voice import failed")
+                              }
+                          },
+                      )
+                  }
+              }
+          
+          '''
+          source = one_replace(source, '    fun cancelVoiceRecording() {', method + '    fun cancelVoiceRecording() {')
+          
+          launcher_anchor = '''    Column(
+                  modifier = Modifier
+                      .fillMaxSize()
+                      .verticalScroll(rememberScrollState())
+                      .padding(16.dp),
+                  verticalArrangement = Arrangement.spacedBy(14.dp),
+              ) {'''
+          # The same Column appears on multiple screens: anchor exclusively within VoicesScreen.
+          voices_start = source.index('private fun VoicesScreen(viewModel: MainViewModel)')
+          voices_end = source.index('private fun HistoryScreen(viewModel: MainViewModel)')
+          voices = source[voices_start:voices_end]
+          launcher = '''    val importWavLauncher = rememberLauncherForActivityResult(
+                  ActivityResultContracts.OpenDocument(),
+              ) { uri ->
+                  if (uri != null) {
+                      viewModel.importVoiceFromWav(voiceName, uri)
+                      voiceName = ""
+                  }
+              }
+          '''
+          voices = one_replace(voices, launcher_anchor, launcher + launcher_anchor)
+          
+          button = '''                OutlinedButton(
+                              onClick = { importWavLauncher.launch(arrayOf("audio/*")) },
+                              enabled = !state.busy && !recorderState.isRecording,
+                              modifier = Modifier.fillMaxWidth(),
+                          ) {
+                              Icon(Icons.Default.Download, contentDescription = null, modifier = Modifier.size(18.dp))
+                              Spacer(Modifier.width(8.dp))
+                              Text("Import WAV (24 kHz, mono)")
+                          }
+                          Text(
+                              "Use only recordings you have permission to use. PCM WAV, 24 kHz, mono, 16-bit; 3–30 seconds.",
+                              style = MaterialTheme.typography.bodySmall,
+                          )
+          '''
+          voices = one_replace(voices,
+              '                if (state.supportsCloning == false) {',
+              button + '                if (state.supportsCloning == false) {')
+          source = source[:voices_start] + voices + source[voices_end:]
+          
+          build = gradle.read_text(encoding='utf-8')
+          build = one_replace(build,
+              '    buildTypes {\n        release {',
+              '    buildTypes {\n        debug {\n            applicationIdSuffix = ".pyke"\n            versionNameSuffix = "-pyke"\n        }\n        release {')
+          
+          xml = manifest.read_text(encoding='utf-8')
+          # Keep the patched debug build visibly distinct from the original installed APK.
+          xml = xml.replace('android:label="@string/app_name"', 'android:label="Qwen3 TTS PYKE Lab"')
+          
+          validator.parent.mkdir(parents=True, exist_ok=True)
+          validator.write_text(source_validator.read_text(encoding='utf-8'), encoding='utf-8')
+          app.write_text(source, encoding='utf-8')
+          gradle.write_text(build, encoding='utf-8')
+          manifest.write_text(xml, encoding='utf-8')
+          print('Applied WAV import patch: Voices > Import WAV (24 kHz, mono)')
+          print('Debug APK package: com.qwen.tts.android.pyke (installs alongside the original)')
+          PYTHON
+          python3 tools/apply_import_patch.py .
+
+      - name: Build separate debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew :app:assembleDebug --stacktrace
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: Qwen3TTS-PYKE-Import-WAV-debug
+          path: app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
